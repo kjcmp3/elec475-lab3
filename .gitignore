@@ -1,0 +1,11 @@
+# python
+__pycache__/
+*.pyc
+
+# datasets & artifacts
+data/
+checkpoints/
+runs/
+outputs/
+*.pt
+*.pth
