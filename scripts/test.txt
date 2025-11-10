@@ -1,0 +1,1 @@
+python src/step1_eval_fcn_resnet50.py --data-root ./data/VOC --batch-size 8 --num-workers 4 --amp
