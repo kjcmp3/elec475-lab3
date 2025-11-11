@@ -160,36 +160,54 @@ class TinySegNet(nn.Module):
             nn.BatchNorm2d(16),
             nn.SiLU()
         )
-        self.s1 = DWConvBlock(16,   chs[0], stride=1, use_se=False)  # 1/2
+        self.s1 = DWConvBlock(16,   chs[0], stride=1, use_se=False)   # 1/2
         self.s2 = DWConvBlock(chs[0], chs[1], stride=2, use_se=False) # 1/4
         self.s3 = DWConvBlock(chs[1], chs[2], stride=2, use_se=True)  # 1/8
         self.s4 = DWConvBlock(chs[2], chs[3], stride=2, use_se=True)  # 1/16
 
         self.aspp = ASPPLite(chs[3], rates=(1,6,12,18), branch_ch=64)  # -> 256
-        self.mid_proj = nn.Conv2d(chs[1], 64, 1)
-        self.low_proj = nn.Conv2d(chs[0], 32, 1)
-        self.dec_mid = nn.Sequential(nn.Conv2d(256, 256, 3, padding=1, bias=False),
-                                     nn.BatchNorm2d(256), nn.SiLU())
-        self.dec_low = nn.Sequential(nn.Conv2d(64, 64, 3, padding=1, bias=False),
-                                     nn.BatchNorm2d(64), nn.SiLU())
+
+        # ---- Decoder projections/aligners ----
+        self.ctx_to_64  = nn.Conv2d(256, 64, 1)   # project ASPP to 64ch to match "mid"
+        self.mid_proj   = nn.Conv2d(chs[1], 64, 1)
+        self.low_proj   = nn.Conv2d(chs[0], 32, 1)
+        self.low_align  = nn.Conv2d(64, 32, 1)    # align upsampled mid path to 32ch before adding low
+
+        self.dec_mid = nn.Sequential(              # keep 64ch after mid fusion
+            nn.Conv2d(64, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.SiLU()
+        )
+        self.dec_low = nn.Sequential(              # after low fusion (32ch) → 64ch
+            nn.Conv2d(32, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.SiLU()
+        )
+
         self.dropout_head = nn.Dropout(0.5)
-        self.cls = nn.Conv2d(64, NUM_CLASSES, 1)
+        self.cls = nn.Conv2d(64, num_classes, 1)
 
     def forward(self, x) -> Dict[str, torch.Tensor]:
         _, _, H, W = x.shape
         x = self.stem(x)
-        low  = self.s1(x)        # 1/2, C=24
-        mid  = self.s2(low)      # 1/4, C=40
-        h8   = self.s3(mid)      # 1/8, C=96
-        high = self.s4(h8)       # 1/16, C=192
+        low  = self.s1(x)       # 1/2, C=24
+        mid  = self.s2(low)     # 1/4, C=40
+        h8   = self.s3(mid)     # 1/8, C=96
+        high = self.s4(h8)      # 1/16, C=192
 
-        ctx = self.aspp(high)    # [N,256,H/16,W/16]
-        up_mid  = F.interpolate(ctx, scale_factor=2, mode="bilinear", align_corners=False)
-        fuse_mid = self.dec_mid(up_mid + self.mid_proj(mid))    # [N,256,H/8,W/8]
-        up_low  = F.interpolate(fuse_mid, scale_factor=2, mode="bilinear", align_corners=False)
-        fuse_low = self.dec_low(up_low + self.low_proj(low))    # [N,64,H/4,W/4]
-        logits_4x = self.cls(self.dropout_head(fuse_low))       # [N,21,H/4,W/4]
-        logits = F.interpolate(logits_4x, size=(H, W), mode="bilinear", align_corners=False)
+        ctx = self.aspp(high)                           # [N,256,H/16,W/16]
+        ctx64 = self.ctx_to_64(ctx)                     # [N,64,H/16,W/16]
+        up_mid = F.interpolate(ctx64, scale_factor=4,   # → 1/4 to match "mid"
+                               mode="bilinear", align_corners=False)
+        fuse_mid = self.dec_mid(up_mid + self.mid_proj(mid))   # [N,64,H/4,W/4]
+
+        up_low = F.interpolate(fuse_mid, scale_factor=2,        # → 1/2 to match "low"
+                               mode="bilinear", align_corners=False)
+        fuse_low_in = self.low_align(up_low) + self.low_proj(low)   # both 32ch @ 1/2
+        fuse_low = self.dec_low(fuse_low_in)                   # [N,64,H/2,W/2]
+
+        logits_half = self.cls(self.dropout_head(fuse_low))    # [N,21,H/2,W/2]
+        logits = F.interpolate(logits_half, size=(H, W), mode="bilinear", align_corners=False)
 
         return {"out": logits, "taps": {"low": low, "mid": mid, "high": high}}
 
@@ -199,7 +217,7 @@ def count_params(m: nn.Module) -> int:
 # --------------------------
 # Metrics
 # --------------------------
-@torch.no_grad()
+@torch.no_grad__()
 def eval_miou(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, np.ndarray]:
     model.eval()
     inter = torch.zeros(NUM_CLASSES, dtype=torch.float64, device=device)
@@ -250,7 +268,6 @@ def main():
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--crop-size", type=int, default=320)
-    # accept both --num-workers and --workers
     ap.add_argument("--num-workers", "--workers", dest="workers", type=int, default=2)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -260,7 +277,6 @@ def main():
     voc_root = resolve_voc_root(Path(args.data_root))
     print(f"[i] Using VOC root: {voc_root}")
 
-    # Datasets / Loaders (now parameterized by crop size)
     train_set = VOCSegPair(voc_root, image_set="train", transform_kind="train", crop_size=args.crop_size)
     val_set   = VOCSegPair(voc_root, image_set="val",   transform_kind="val",   crop_size=args.crop_size)
 
@@ -269,13 +285,11 @@ def main():
     val_loader   = DataLoader(val_set, batch_size=max(1, args.batch_size//2), shuffle=False,
                               num_workers=args.workers, pin_memory=True)
 
-    # Model
     model = TinySegNet(num_classes=NUM_CLASSES)
     print(f"[i] TinySegNet params: {count_params(model)/1e6:.3f}M")
     device = torch.device(args.device)
     model.to(device)
 
-    # Optimizer / Poly LR
     optim = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     total_iters = args.epochs * len(train_loader)
     scheduler = LambdaLR(optim, lr_lambda=lambda it: poly_lr_lambda(it, total_iters, power=0.9))
