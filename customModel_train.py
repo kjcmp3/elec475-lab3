@@ -29,7 +29,6 @@ NUM_CLASSES = 21
 IGNORE_INDEX = 255
 
 def resolve_voc_root(data_root: Path) -> Path:
-    """Return a path whose tree contains VOCdevkit/VOC2012."""
     if (data_root / "VOCdevkit" / "VOC2012").is_dir():
         return data_root
     if (data_root / "VOC2012").is_dir():
@@ -51,9 +50,8 @@ def train_transform(img, mask, crop=320):
     img = TF.resize(img, new_size, InterpolationMode.BILINEAR)
     mask = TF.resize(mask, new_size, InterpolationMode.NEAREST)
 
-    # random crop
-    i = torch.randint(0, new_size[0]-crop+1, ()).item()
-    j = torch.randint(0, new_size[1]-crop+1, ()).item()
+    i = torch.randint(0, new_size[0] - crop + 1, ()).item()
+    j = torch.randint(0, new_size[1] - crop + 1, ()).item()
     img = TF.crop(img, i, j, crop, crop)
     mask = TF.crop(mask, i, j, crop, crop)
 
@@ -84,23 +82,23 @@ def val_transform(img, mask, crop=320):
 # Dataset wrapper
 # --------------------------
 class VOCSegPair(Dataset):
-    def __init__(self, root: Path, image_set: str, crop_size: int, is_train: bool):
+    def __init__(self, root: Path, image_set: str, transform_kind: str = "train", crop_size: int = 320):
         self.ds = VOCSegmentation(root=str(root), year="2012", image_set=image_set, download=False)
-        self.crop_size = crop_size
-        self.is_train = is_train
+        self.kind = transform_kind
+        self.crop = crop_size
 
     def __len__(self): return len(self.ds)
 
     def __getitem__(self, idx):
         img, mask = self.ds[idx]
-        if self.is_train:
-            img_t, mask_t = train_transform(img, mask, crop=self.crop_size)
+        if self.kind == "train":
+            img_t, mask_t = train_transform(img, mask, crop=self.crop)
         else:
-            img_t, mask_t = val_transform(img, mask, crop=self.crop_size)
+            img_t, mask_t = val_transform(img, mask, crop=self.crop)
         return img_t, mask_t
 
 # --------------------------
-# Model (same as your TinySegNet)
+# Model: TinySegNet (≈≤1M params)
 # --------------------------
 class SE(nn.Module):
     def __init__(self, c: int, r: int = 4):
@@ -162,52 +160,41 @@ class TinySegNet(nn.Module):
             nn.BatchNorm2d(16),
             nn.SiLU()
         )
-        self.s1 = DWConvBlock(16,  chs[0], stride=1, use_se=False)   # 1/2
+        self.s1 = DWConvBlock(16,   chs[0], stride=1, use_se=False)  # 1/2
         self.s2 = DWConvBlock(chs[0], chs[1], stride=2, use_se=False) # 1/4
         self.s3 = DWConvBlock(chs[1], chs[2], stride=2, use_se=True)  # 1/8
         self.s4 = DWConvBlock(chs[2], chs[3], stride=2, use_se=True)  # 1/16
 
         self.aspp = ASPPLite(chs[3], rates=(1,6,12,18), branch_ch=64)  # -> 256
-
         self.mid_proj = nn.Conv2d(chs[1], 64, 1)
         self.low_proj = nn.Conv2d(chs[0], 32, 1)
-
-        self.dec_mid = nn.Sequential(
-            nn.Conv2d(256, 256, 3, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.SiLU()
-        )
-        self.dec_low = nn.Sequential(
-            nn.Conv2d(64, 64, 3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.SiLU()
-        )
-
+        self.dec_mid = nn.Sequential(nn.Conv2d(256, 256, 3, padding=1, bias=False),
+                                     nn.BatchNorm2d(256), nn.SiLU())
+        self.dec_low = nn.Sequential(nn.Conv2d(64, 64, 3, padding=1, bias=False),
+                                     nn.BatchNorm2d(64), nn.SiLU())
         self.dropout_head = nn.Dropout(0.5)
-        self.cls = nn.Conv2d(64, num_classes, 1)
+        self.cls = nn.Conv2d(64, NUM_CLASSES, 1)
 
     def forward(self, x) -> Dict[str, torch.Tensor]:
-        n, _, H, W = x.shape
+        _, _, H, W = x.shape
         x = self.stem(x)
-        low  = self.s1(x)
-        mid  = self.s2(low)
-        h8   = self.s3(mid)
-        high = self.s4(h8)
+        low  = self.s1(x)        # 1/2, C=24
+        mid  = self.s2(low)      # 1/4, C=40
+        h8   = self.s3(mid)      # 1/8, C=96
+        high = self.s4(h8)       # 1/16, C=192
 
-        ctx = self.aspp(high)
-        up_mid = F.interpolate(ctx, scale_factor=2, mode="bilinear", align_corners=False)
-        fuse_mid = self.dec_mid(up_mid + self.mid_proj(mid))
-
-        up_low = F.interpolate(fuse_mid, scale_factor=2, mode="bilinear", align_corners=False)
-        fuse_low = self.dec_low(up_low + self.low_proj(low))
-
-        logits_4x = self.cls(self.dropout_head(fuse_low))
+        ctx = self.aspp(high)    # [N,256,H/16,W/16]
+        up_mid  = F.interpolate(ctx, scale_factor=2, mode="bilinear", align_corners=False)
+        fuse_mid = self.dec_mid(up_mid + self.mid_proj(mid))    # [N,256,H/8,W/8]
+        up_low  = F.interpolate(fuse_mid, scale_factor=2, mode="bilinear", align_corners=False)
+        fuse_low = self.dec_low(up_low + self.low_proj(low))    # [N,64,H/4,W/4]
+        logits_4x = self.cls(self.dropout_head(fuse_low))       # [N,21,H/4,W/4]
         logits = F.interpolate(logits_4x, size=(H, W), mode="bilinear", align_corners=False)
 
         return {"out": logits, "taps": {"low": low, "mid": mid, "high": high}}
 
-def count_params(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+def count_params(m: nn.Module) -> int:
+    return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
 # --------------------------
 # Metrics
@@ -262,48 +249,35 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--workers", dest="workers", type=int, default=2)
-    ap.add_argument("--num-workers", dest="workers", type=int, help="Alias for --workers")
-    ap.add_argument("--crop-size", dest="crop_size", type=int, default=320)
+    ap.add_argument("--crop-size", type=int, default=320)
+    # accept both --num-workers and --workers
+    ap.add_argument("--num-workers", "--workers", dest="workers", type=int, default=2)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
 
-    try:
-        voc_root = resolve_voc_root(Path(args.data_root))
-    except FileNotFoundError as e:
-        print(str(e))
-        print("Hint: in Colab, use /content/data prepared by your KaggleHub cell.")
-        raise
+    voc_root = resolve_voc_root(Path(args.data_root))
     print(f"[i] Using VOC root: {voc_root}")
 
-    # Device handling
-    if args.device == "cuda" and not torch.cuda.is_available():
-        print("[!] CUDA requested but not available. Falling back to CPU.")
-        device = torch.device("cpu")
-    else:
-        device = torch.device(args.device)
-    print(f"[i] Device: {device}")
+    # Datasets / Loaders (now parameterized by crop size)
+    train_set = VOCSegPair(voc_root, image_set="train", transform_kind="train", crop_size=args.crop_size)
+    val_set   = VOCSegPair(voc_root, image_set="val",   transform_kind="val",   crop_size=args.crop_size)
 
-    # Datasets / Loaders
-    train_set = VOCSegPair(voc_root, image_set="train", crop_size=args.crop_size, is_train=True)
-    val_set   = VOCSegPair(voc_root, image_set="val",   crop_size=args.crop_size, is_train=False)
-
-    pin_mem = device.type == "cuda"
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.workers, pin_memory=pin_mem, drop_last=True)
+                              num_workers=args.workers, pin_memory=True, drop_last=True)
     val_loader   = DataLoader(val_set, batch_size=max(1, args.batch_size//2), shuffle=False,
-                              num_workers=args.workers, pin_memory=pin_mem)
+                              num_workers=args.workers, pin_memory=True)
 
     # Model
     model = TinySegNet(num_classes=NUM_CLASSES)
     print(f"[i] TinySegNet params: {count_params(model)/1e6:.3f}M")
+    device = torch.device(args.device)
     model.to(device)
 
-    # Optimizer + poly LR
+    # Optimizer / Poly LR
     optim = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    total_iters = max(1, args.epochs * len(train_loader))
+    total_iters = args.epochs * len(train_loader)
     scheduler = LambdaLR(optim, lr_lambda=lambda it: poly_lr_lambda(it, total_iters, power=0.9))
 
     best_miou = 0.0
