@@ -217,7 +217,7 @@ def count_params(m: nn.Module) -> int:
 # --------------------------
 # Metrics
 # --------------------------
-@torch.no_grad__()
+@torch.no_grad_()
 def eval_miou(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, np.ndarray]:
     model.eval()
     inter = torch.zeros(NUM_CLASSES, dtype=torch.float64, device=device)
