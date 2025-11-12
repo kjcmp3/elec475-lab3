@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TinySegNet on VOC2012 (21 classes): training with mIoU logging.
+TinySegNet on VOC2012 (21 classes): training with per-epoch metrics, CSV log,
+and learning-curve plot.
 
 - Encoder: 4 stages (depthwise-separable convs) with strides {2,2,2,2}
   channels {24, 40, 96, 192}; SE (r=4) in stages 3–4.
-- Taps: low (1/2), mid (1/4), high (1/16).
-- Context: ASPP-lite (rates {1,6,12,18}, 64 ch each) -> concat 256 -> BN, SiLU, Dropout(0.5).
 - Decoder: robust size-matching (upsample to exact tap sizes).
   ASPP->64; fuse with mid (64), conv; upsample & reduce to 32, fuse with low (32), conv→64.
 - Classifier: 1×1 -> 21, then upsample to input size.
-- Training: crop=320 (multiple of 16), AdamW(1e-3, wd=1e-4), poly LR, CE(ignore=255).
+- Training: crop=320 (multiple of 16), AdamW(1e-3, wd=1e-4), poly LR over *epochs*,
+  CE(ignore=255).
 """
 
 import argparse
+import csv
+import time
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -28,6 +30,7 @@ from torchvision.datasets import VOCSegmentation
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 # --------------------------
 # Constants
@@ -109,7 +112,7 @@ class VOCSegPair(Dataset):
         return img_t, mask_t
 
 # --------------------------
-# Model: TinySegNet
+# Model: TinySegNet (matches your eval/test)
 # --------------------------
 class SE(nn.Module):
     def __init__(self, c: int, r: int = 4):
@@ -246,10 +249,7 @@ def eval_miou(model: nn.Module, loader: DataLoader, device: torch.device) -> Tup
 # --------------------------
 # Train
 # --------------------------
-def poly_lr_lambda(it: int, total: int, power: float = 0.9):
-    return (1.0 - it / float(total)) ** power
-
-def train_one_epoch(model, loader, optim, device, epoch_it, total_its):
+def train_one_epoch(model, loader, optim, device):
     model.train()
     ce = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
     running = 0.0
@@ -262,7 +262,6 @@ def train_one_epoch(model, loader, optim, device, epoch_it, total_its):
         loss.backward()
         optim.step()
         running += float(loss.item()) * imgs.size(0)
-        epoch_it[0] += 1
         pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{optim.param_groups[0]['lr']:.2e}")
     return running / len(loader.dataset)
 
@@ -278,6 +277,8 @@ def main():
     ap.add_argument("--crop-size", type=int, default=320)  # multiple of 16
     ap.add_argument("--num-workers", "--workers", dest="workers", type=int, default=2)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--log-csv", type=str, default="train_log.csv")
+    ap.add_argument("--curves-png", type=str, default="training_curves.png")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
@@ -288,35 +289,97 @@ def main():
     train_set = VOCSegPair(voc_root, image_set="train", transform_kind="train", crop_size=args.crop_size)
     val_set   = VOCSegPair(voc_root, image_set="val",   transform_kind="val",   crop_size=args.crop_size)
 
-    pin = (args.device == "cuda")
+    device = torch.device(args.device)
+    pin = (device.type == "cuda")
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.workers, pin_memory=pin, drop_last=True)
     val_loader   = DataLoader(val_set, batch_size=max(1, args.batch_size//2), shuffle=False,
                               num_workers=args.workers, pin_memory=pin)
 
-    model = TinySegNet(num_classes=NUM_CLASSES)
+    model = TinySegNet(num_classes=NUM_CLASSES).to(device)
     print(f"[i] TinySegNet params: {count_params(model)/1e6:.3f}M")
-    device = torch.device(args.device)
-    model.to(device)
 
     optim = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    total_iters = args.epochs * len(train_loader)
-    scheduler = LambdaLR(optim, lr_lambda=lambda it: poly_lr_lambda(it, total_iters, power=0.9))
+
+    # Poly LR over *epochs* (not per-iteration) to keep things simple & deterministic
+    poly_power = 0.9
+    scheduler = LambdaLR(optim, lr_lambda=lambda e: (1.0 - (e / max(1, args.epochs))) ** poly_power)
+
+    # ---- Metrics storage ----
+    epochs = []
+    train_losses = []
+    val_mious = []
+    lrs = []
+    epoch_secs = []
 
     best_miou = 0.0
-    global_it = [0]
+    header_written = False
+    csv_path = Path(args.log_csv)
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optim, device, global_it, total_iters)
+        t0 = time.time()
+        train_loss = train_one_epoch(model, train_loader, optim, device)
+        # step LR *after* this epoch’s updates
         scheduler.step()
+
         miou, _ = eval_miou(model, val_loader, device)
-        print(f"Epoch {epoch:03d}/{args.epochs} | Train CE: {train_loss:.4f} | Val mIoU: {miou:.4f} | LR: {optim.param_groups[0]['lr']:.3e}")
+        cur_lr = optim.param_groups[0]['lr']
+        dt = time.time() - t0
+
+        print(f"Epoch {epoch:03d}/{args.epochs} | Train CE: {train_loss:.4f} | Val mIoU: {miou:.4f} | LR: {cur_lr:.3e} | {dt:.1f}s")
+
+        # record metrics
+        epochs.append(epoch)
+        train_losses.append(train_loss)
+        val_mious.append(miou)
+        lrs.append(cur_lr)
+        epoch_secs.append(dt)
+
+        # CSV log (append)
+        with csv_path.open("a", newline="") as f:
+            w = csv.writer(f)
+            if not header_written and csv_path.stat().st_size == 0:
+                w.writerow(["epoch", "train_ce", "val_miou", "lr", "epoch_seconds"])
+                header_written = True
+            w.writerow([epoch, f"{train_loss:.6f}", f"{miou:.6f}", f"{cur_lr:.6e}", f"{dt:.3f}"])
+
+        # save best
         if miou > best_miou:
             best_miou = miou
             torch.save({"model": model.state_dict(), "epoch": epoch, "miou": best_miou}, "tinyseg_best.pt")
             print(f"[i] New best mIoU {best_miou:.4f}. Saved -> tinyseg_best.pt")
 
+    # ---- Plot curves at the end ----
+    try:
+        fig = plt.figure(figsize=(9, 6))
+        ax1 = fig.add_subplot(2,1,1)
+        ax1.plot(epochs, train_losses, label="Train CE")
+        ax1.set_xlabel("Epoch")
+        ax1.set_ylabel("Cross-Entropy Loss")
+        ax1.grid(True)
+        ax1.legend()
+
+        ax2 = fig.add_subplot(2,1,2)
+        ax2.plot(epochs, val_mious, label="Val mIoU")
+        ax2_t = ax2.twinx()
+        ax2_t.plot(epochs, lrs, label="LR", linestyle="--")
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("mIoU")
+        ax2_t.set_ylabel("Learning Rate")
+        ax2.grid(True)
+        # Build a joint legend
+        lines, labels = ax2.get_legend_handles_labels()
+        lines2, labels2 = ax2_t.get_legend_handles_labels()
+        ax2.legend(lines + lines2, labels + labels2, loc="best")
+
+        plt.tight_layout()
+        plt.savefig(args.curves_png, dpi=150)
+        print(f"[i] Saved curves -> {args.curves_png}")
+    except Exception as e:
+        print(f"[!] Plotting failed: {e}")
+
     print(f"[✓] Training done. Best mIoU: {best_miou:.4f}")
+    print(f"[i] Log CSV: {csv_path.resolve()}")
 
 if __name__ == "__main__":
     main()
