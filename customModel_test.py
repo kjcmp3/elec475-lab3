@@ -41,7 +41,7 @@ def voc_palette():
     return palette
 
 # --------------------------
-# TinySegNet (same as training)
+# TinySegNet (MATCHES TRAIN CHECKPOINT)
 # --------------------------
 class SE(nn.Module):
     def __init__(self, c: int, r: int = 4):
@@ -104,49 +104,76 @@ class TinySegNet(nn.Module):
         self.s2 = DWConvBlock(chs[0], chs[1], stride=2, use_se=False) # 1/4
         self.s3 = DWConvBlock(chs[1], chs[2], stride=2, use_se=True)  # 1/8
         self.s4 = DWConvBlock(chs[2], chs[3], stride=2, use_se=True)  # 1/16
-        self.aspp = ASPPLite(chs[3], rates=(1,6,12,18), branch_ch=64) # -> 256
 
-        self.mid_proj = nn.Conv2d(chs[1], 64, 1)
-        self.low_proj = nn.Conv2d(chs[0], 32, 1)
-        self.dec_mid  = nn.Sequential(nn.Conv2d(256, 256, 3, padding=1, bias=False),
-                                      nn.BatchNorm2d(256), nn.SiLU())
-        self.dec_low  = nn.Sequential(nn.Conv2d(64, 64, 3, padding=1, bias=False),
-                                      nn.BatchNorm2d(64), nn.SiLU())
+        self.aspp = ASPPLite(chs[3], rates=(1,6,12,18), branch_ch=64)  # -> 256
+
+        # PROJECTIONS TO MATCH TRAINED CHECKPOINT
+        self.ctx_to_64 = nn.Conv2d(256, 64, 1, bias=False)   # <— present at train time
+        self.mid_proj  = nn.Conv2d(chs[1], 64, 1, bias=False)
+        self.mid_to_32 = nn.Conv2d(64, 32, 1, bias=False)    # reduce fused mid to 32 for low fusion
+        self.low_proj  = nn.Conv2d(chs[0], 32, 1, bias=False)
+
+        # DECODERS (input chans must match checkpoint)
+        self.dec_mid = nn.Sequential(
+            nn.Conv2d(64, 64, 3, padding=1, bias=False),     # ckpt had in=64
+            nn.BatchNorm2d(64),
+            nn.SiLU()
+        )
+        self.dec_low = nn.Sequential(
+            nn.Conv2d(32, 64, 3, padding=1, bias=False),     # ckpt had in=32, out=64
+            nn.BatchNorm2d(64),
+            nn.SiLU()
+        )
+
         self.dropout_head = nn.Dropout(0.5)
         self.cls = nn.Conv2d(64, num_classes, 1)
 
     def forward(self, x) -> Dict[str, torch.Tensor]:
         _, _, H, W = x.shape
         x = self.stem(x)
-        low  = self.s1(x)        # 1/2
-        mid  = self.s2(low)      # 1/4
-        h8   = self.s3(mid)      # 1/8
-        high = self.s4(h8)       # 1/16
-        ctx = self.aspp(high)    # [N,256,H/16,W/16]
+        low  = self.s1(x)        # 1/2, C=24
+        mid  = self.s2(low)      # 1/4, C=40
+        h8   = self.s3(mid)      # 1/8, C=96
+        high = self.s4(h8)       # 1/16, C=192
 
-        up_mid   = F.interpolate(ctx, scale_factor=2, mode="bilinear", align_corners=False)
-        fuse_mid = self.dec_mid(up_mid + self.mid_proj(mid))         # [N,256,H/8,W/8]
-        up_low   = F.interpolate(fuse_mid, scale_factor=2, mode="bilinear", align_corners=False)
-        fuse_low = self.dec_low(up_low + self.low_proj(low))         # [N,64,H/4,W/4]
-        logits_4x = self.cls(self.dropout_head(fuse_low))            # [N,21,H/4,W/4]
+        ctx = self.aspp(high)    # [N,256,h/16,w/16]
+
+        # --- SIZE-ROBUST UPSAMPLING (avoid 40 vs 80 mismatches) ---
+        up_mid = F.interpolate(ctx, size=mid.shape[-2:], mode="bilinear", align_corners=False)  # to 1/4
+        up_mid = self.ctx_to_64(up_mid)                              # 256->64
+        fuse_mid = self.dec_mid(up_mid + self.mid_proj(mid))         # 64 + 64 -> 64 (1/4)
+
+        up_low = F.interpolate(fuse_mid, size=low.shape[-2:], mode="bilinear", align_corners=False)  # to 1/2
+        up_low = self.mid_to_32(up_low)                              # 64->32
+        fuse_low = self.dec_low(up_low + self.low_proj(low))         # 32 + 32 -> 64 (1/2)
+
+        logits_4x = self.cls(self.dropout_head(fuse_low))            # [N,21,1/2,1/2]
         logits = F.interpolate(logits_4x, size=(H, W), mode="bilinear", align_corners=False)
         return {"out": logits, "taps": {"low": low, "mid": mid, "high": high}}
 
 # --------------------------
-# Transforms (eval)
+# Transforms (eval) — keep sizes divisible by 16
 # --------------------------
 def normalize(t: torch.Tensor) -> torch.Tensor:
     return TF.normalize(t, IMAGENET_MEAN, IMAGENET_STD)
 
+def _nearest_multiple_of_16(n: int) -> int:
+    return max(16, (n // 16) * 16)
+
 def val_transform(img, mask, crop=320):
+    # Ensure final crop is a multiple of 16 to play nicely with 1/16 encoder
+    crop = _nearest_multiple_of_16(crop)
+
     h, w = img.height, img.width
     short = min(h, w)
     scale = 360.0/short
     new_size = (int(round(h*scale)), int(round(w*scale)))
     img  = TF.resize(img,  new_size, InterpolationMode.BILINEAR)
     mask = TF.resize(mask, new_size, InterpolationMode.NEAREST)
+
     img  = TF.center_crop(img,  [crop, crop])
     mask = TF.center_crop(mask, [crop, crop])
+
     img_t  = normalize(TF.to_tensor(img))
     mask_t = TF.pil_to_tensor(mask).squeeze(0).long()
     return img_t, mask_t
@@ -198,13 +225,12 @@ def safe_load_ckpt(path: str, map_location):
     if not p.exists() or p.stat().st_size == 0:
         raise FileNotFoundError(f"Checkpoint not found or empty: {p}")
     try:
-        return torch.load(p, map_location=map_location)  # PyTorch>=2.6 defaults to weights_only=True
+        return torch.load(p, map_location=map_location)  # PyTorch>=2.6: weights_only=True
     except Exception as e1:
         print(f"[!] Retry torch.load(weights_only=False) due to: {e1}")
         return torch.load(p, map_location=map_location, weights_only=False)
 
 def load_state_forgiving(model: nn.Module, state: Dict[str, torch.Tensor]) -> None:
-    """Load only keys whose shapes match the current model to avoid size-mismatch errors."""
     model_sd = model.state_dict()
     compatible = {}
     skipped_mismatch = []
@@ -218,8 +244,7 @@ def load_state_forgiving(model: nn.Module, state: Dict[str, torch.Tensor]) -> No
         else:
             skipped_missing.append(k)
 
-    msg = f"[i] Loading {len(compatible)} / {len(model_sd)} tensors from checkpoint"
-    print(msg)
+    print(f"[i] Loading {len(compatible)} / {len(model_sd)} tensors from checkpoint")
     if skipped_mismatch:
         print(f"[!] Skipped {len(skipped_mismatch)} keys with shape mismatch (e.g., {skipped_mismatch[0]})")
     if skipped_missing:
