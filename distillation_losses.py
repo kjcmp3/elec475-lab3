@@ -2,14 +2,9 @@
 import torch
 import torch.nn.functional as F
 
+# VOC ignore label
 IGNORE_INDEX = 255
 
-def softmax_with_temperature(logits: torch.Tensor, T: float) -> torch.Tensor:
-    """
-    logits: [B, C, H, W]
-    returns: [B, C, H, W] probabilities with temperature T
-    """
-    return F.softmax(logits / T, dim=1)
 
 def response_distillation_loss(
     student_logits: torch.Tensor,
@@ -19,52 +14,72 @@ def response_distillation_loss(
     ignore_index: int = IGNORE_INDEX,
 ) -> torch.Tensor:
     """
-    Hinton-style KL / cross-entropy between softened teacher & student outputs.
+    Response-based KD loss (Hinton-style) over valid pixels only.
 
-    student_logits, teacher_logits: [B, C, H, W]
-    targets: [B, H, W] (used only to mask ignore_index)
+    Args:
+        student_logits: [B, C, H, W] raw logits from student (z_s).
+        teacher_logits: [B, C, H, W] raw logits from teacher (z_t).
+        targets:        [B, H, W] int labels, used only for the ignore mask.
+        T:              temperature.
+        ignore_index:   label to ignore in the mask.
+
+    Returns:
+        Scalar KD loss (T^2 * KL(p_t^T || p_s^T)).
     """
-    B, C, H, W = student_logits.shape
+    device = student_logits.device
 
-    # mask out void pixels
-    valid = (targets != ignore_index).view(B, 1, H, W)   # [B,1,H,W]
-    valid = valid.expand(-1, C, -1, -1)                 # [B,C,H,W]
+    # Mask out ignore pixels
+    # valid: [B, H, W]
+    valid = (targets != ignore_index)
+    if valid.sum() == 0:
+        # no valid pixels → return 0 with grad
+        return torch.zeros((), device=device, requires_grad=True)
 
-    # flatten all valid spatial locations
-    s = student_logits[valid].view(-1, C)  # [N_valid, C]
-    t = teacher_logits[valid].view(-1, C)  # [N_valid, C]
+    # [B, C, H, W] -> [B, H, W, C] -> [N, C] for valid pixels only
+    s = student_logits.permute(0, 2, 3, 1)[valid]  # [N, C]
+    t = teacher_logits.permute(0, 2, 3, 1)[valid]  # [N, C]
 
-    # softened distributions
-    log_p_s = F.log_softmax(s / T, dim=1)   # [N_valid, C]
-    p_t     = F.softmax(t / T, dim=1)       # [N_valid, C]
+    # Softmax with temperature
+    s_T = s / T
+    t_T = t / T
 
-    # cross-entropy: -sum p_t * log p_s
-    kd_loss = F.kl_div(log_p_s, p_t, reduction="batchmean") * (T * T)
-    return kd_loss
+    log_p_s = F.log_softmax(s_T, dim=-1)
+    p_t     = F.softmax(t_T, dim=-1)
+
+    # KL(p_t || p_s) with "batchmean" over N
+    kd = F.kl_div(log_p_s, p_t, reduction="batchmean")
+
+    # Hinton-style scaling
+    kd = kd * (T * T)
+    return kd
+
 
 def feature_distillation_cosine_loss(
-    student_feat: torch.Tensor,
-    teacher_feat: torch.Tensor,
+    feat_s: torch.Tensor,
+    feat_t: torch.Tensor,
+    eps: float = 1e-8,
 ) -> torch.Tensor:
     """
-    Cosine-based feature distillation.
+    Feature-based KD loss using cosine distance between aligned features.
 
-    student_feat: [B, C_s, H_s, W_s]
-    teacher_feat: [B, C_t, H_t, W_t]
-    We up/downsample and linearly project both to a common shape if needed
-    before applying cosine similarity. This function assumes they've
-    already been spatially+channel aligned to same shape [B, C, H, W].
+    Both feats are expected to have shape [B, C, H, W] (already aligned).
+
+    We compute cosine similarity per spatial location and then average:
+      L_feat = 1 - mean_cos_sim
     """
-    assert student_feat.shape == teacher_feat.shape, (
-        f"Shapes must match for cosine feat loss, got {student_feat.shape} vs {teacher_feat.shape}"
-    )
+    # [B, C, H, W] -> [B, C, H*W]
+    B, C, H, W = feat_s.shape
+    feat_s_flat = feat_s.view(B, C, -1)   # [B, C, N]
+    feat_t_flat = feat_t.view(B, C, -1)   # [B, C, N]
 
-    B = student_feat.shape[0]
-    # flatten to [B, C*H*W]
-    s_flat = student_feat.view(B, -1)
-    t_flat = teacher_feat.view(B, -1)
+    # Normalize along channel dim
+    feat_s_norm = feat_s_flat / (feat_s_flat.norm(dim=1, keepdim=True) + eps)
+    feat_t_norm = feat_t_flat / (feat_t_flat.norm(dim=1, keepdim=True) + eps)
 
-    # cosine similarity per sample
-    cos_sim = F.cosine_similarity(s_flat, t_flat, dim=1)  # [B]
-    loss = (1.0 - cos_sim).mean()
+    # Cosine sim per spatial location: [B, N]
+    cos_sim = (feat_s_norm * feat_t_norm).sum(dim=1)
+
+    # Average over batch and spatial locations
+    mean_cos = cos_sim.mean()
+    loss = 1.0 - mean_cos
     return loss

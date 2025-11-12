@@ -4,7 +4,7 @@
 Knowledge Distillation training script:
 
 Teacher: pretrained FCN-ResNet50 (21 classes, VOC label mapping)
-Student: custom TinySegNet from customModel.py
+Student: custom TinyVOCSeg from customModel.py
 
 Loss:
   L_total = alpha * CE(student, y) +
@@ -27,7 +27,7 @@ Run example (Colab):
 
 import argparse
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -48,12 +48,13 @@ from distillation_losses import (
     IGNORE_INDEX,
 )
 
-# import your student model
-from customModel import TinySegNet  # change class name if needed
+# ---- import your student model (TinyVOCSeg) ----
+from customModel import TinyVOCSeg  # <--- matches your tiny_segnet.py
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 NUM_CLASSES   = 21
+
 
 # --------------------------
 # Dataset / transforms
@@ -65,14 +66,17 @@ def resolve_voc_root(data_root: Path) -> Path:
         return data_root.parent if data_root.name == "VOC2012" else data_root
     raise FileNotFoundError(f"VOCdevkit/VOC2012 not found under: {data_root}")
 
+
 def normalize(t: torch.Tensor) -> torch.Tensor:
     return TF.normalize(t, IMAGENET_MEAN, IMAGENET_STD)
+
 
 def train_transform(img, mask, crop=320):
     h, w = img.height, img.width
     short = min(h, w)
     scale = 360.0 / short
     new_size = (int(round(h * scale)), int(round(w * scale)))
+
     img  = TF.resize(img, new_size, InterpolationMode.BILINEAR)
     mask = TF.resize(mask, new_size, InterpolationMode.NEAREST)
 
@@ -82,17 +86,20 @@ def train_transform(img, mask, crop=320):
     mask = TF.crop(mask, i, j, crop, crop)
 
     if torch.rand(()) < 0.5:
-        img = TF.hflip(img); mask = TF.hflip(mask)
+        img = TF.hflip(img)
+        mask = TF.hflip(mask)
 
     img_t  = normalize(TF.to_tensor(img))
     mask_t = TF.pil_to_tensor(mask).squeeze(0).long()
     return img_t, mask_t
+
 
 def val_transform(img, mask, crop=320):
     h, w = img.height, img.width
     short = min(h, w)
     scale = 360.0 / short
     new_size = (int(round(h * scale)), int(round(w * scale)))
+
     img  = TF.resize(img, new_size, InterpolationMode.BILINEAR)
     mask = TF.resize(mask, new_size, InterpolationMode.NEAREST)
 
@@ -103,13 +110,15 @@ def val_transform(img, mask, crop=320):
     mask_t = TF.pil_to_tensor(mask).squeeze(0).long()
     return img_t, mask_t
 
+
 class VOCSegPair(Dataset):
     def __init__(self, root: Path, image_set: str, transform_kind: str = "train", crop_size: int = 320):
         self.ds = VOCSegmentation(root=str(root), year="2012", image_set=image_set, download=False)
         self.kind = transform_kind
         self.crop = crop_size
 
-    def __len__(self): return len(self.ds)
+    def __len__(self):
+        return len(self.ds)
 
     def __getitem__(self, idx):
         img, mask = self.ds[idx]
@@ -117,6 +126,7 @@ class VOCSegPair(Dataset):
             return train_transform(img, mask, crop=self.crop)
         else:
             return val_transform(img, mask, crop=self.crop)
+
 
 # --------------------------
 # Teacher wrapper for feature taps
@@ -133,7 +143,7 @@ class FCNTeacherWithFeat(nn.Module):
         self.model = fcn_resnet50(weights=weights)
         self._feat = None
 
-        # register a hook on layer3 of the backbone
+        # hook on layer3
         self.model.backbone.layer3.register_forward_hook(self._hook_layer3)
 
         # freeze teacher parameters
@@ -142,22 +152,21 @@ class FCNTeacherWithFeat(nn.Module):
         self.eval()
 
     def _hook_layer3(self, module, inp, out):
-        # out: [B, C_t, H_t, W_t]
-        self._feat = out
+        self._feat = out  # [B, C_t, H_t, W_t]
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # model(x)["out"] is [B,21,H,W]; hook captures layer3 feat in self._feat
-        out = self.model(x)["out"]
-        feat = self._feat
+        out = self.model(x)["out"]   # [B,21,H,W]
+        feat = self._feat            # [B,1024,H_t,W_t] for ResNet-50
         return out, feat
+
 
 # --------------------------
 # Feature alignment module
 # --------------------------
 class FeatureAlign(nn.Module):
     """
-    Projects student + teacher feature maps to a shared [B, C_common, H_common, W_common]
-    using bilinear resize and 1x1 convs. This is trainable and learned jointly with the student.
+    Projects student + teacher feature maps to shared [B, C_common, H_common, W_common]
+    using bilinear resize and 1x1 convs. Trainable, learned with the student.
     """
     def __init__(self, c_student: int, c_teacher: int, c_common: int = 256):
         super().__init__()
@@ -166,15 +175,17 @@ class FeatureAlign(nn.Module):
         self.bn_s = nn.BatchNorm2d(c_common)
         self.bn_t = nn.BatchNorm2d(c_common)
 
-    def forward(self, feat_s: torch.Tensor, feat_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # spatial align: resize both to the same HxW (use teacher's spatial size)
+    def forward(self, feat_s: torch.Tensor, feat_t: torch.Tensor):
+        # resize student to teacher's spatial size
         H_t, W_t = feat_t.shape[-2:]
-        feat_s_resized = F.interpolate(feat_s, size=(H_t, W_t), mode="bilinear", align_corners=False)
+        feat_s_resized = F.interpolate(
+            feat_s, size=(H_t, W_t), mode="bilinear", align_corners=False
+        )
 
-        # project channels
         s = self.bn_s(self.proj_s(feat_s_resized))
         t = self.bn_t(self.proj_t(feat_t))
         return s, t
+
 
 # --------------------------
 # mIoU metric (for logging)
@@ -185,9 +196,11 @@ def eval_miou(student: nn.Module, loader: DataLoader, device: torch.device) -> f
     num_classes = NUM_CLASSES
     inter = torch.zeros(num_classes, dtype=torch.float64, device=device)
     union = torch.zeros(num_classes, dtype=torch.float64, device=device)
+
     for imgs, masks in loader:
         imgs = imgs.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
+
         pred = student(imgs)["out"].argmax(1)
         valid = masks != IGNORE_INDEX
         for c in range(num_classes):
@@ -195,14 +208,17 @@ def eval_miou(student: nn.Module, loader: DataLoader, device: torch.device) -> f
             tc = (masks == c) & valid
             inter[c] += (pc & tc).sum()
             union[c] += (pc | tc).sum()
+
     iou = torch.where(union > 0, inter / union, torch.zeros_like(union))
     return float(iou.mean().item())
+
 
 # --------------------------
 # Train loop
 # --------------------------
 def poly_lr_lambda(e: int, total_epochs: int, power: float = 0.9):
     return (1.0 - e / float(total_epochs)) ** power
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -223,7 +239,8 @@ def main():
     ap.add_argument("--temperature", type=float, default=4.0, help="temperature for KD")
     args = ap.parse_args()
 
-    torch.manual_seed(args.seed); np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     voc_root = resolve_voc_root(Path(args.data_root))
     print(f"[i] Using VOC root: {voc_root}")
@@ -234,21 +251,24 @@ def main():
     train_set = VOCSegPair(voc_root, image_set="train", transform_kind="train", crop_size=args.crop_size)
     val_set   = VOCSegPair(voc_root, image_set="val",   transform_kind="val",   crop_size=args.crop_size)
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=pin, drop_last=True)
-    val_loader   = DataLoader(val_set, batch_size=max(1, args.batch_size//2), shuffle=False,
-                              num_workers=args.num_workers, pin_memory=pin)
+    train_loader = DataLoader(
+        train_set, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=pin, drop_last=True
+    )
+    val_loader   = DataLoader(
+        val_set, batch_size=max(1, args.batch_size // 2), shuffle=False,
+        num_workers=args.num_workers, pin_memory=pin
+    )
 
-    # Student model
-    student = TinySegNet(num_classes=NUM_CLASSES).to(device)
+    # ---- Student model (TinyVOCSeg) ----
+    student = TinyVOCSeg(n_classes=NUM_CLASSES).to(device)
     print(f"[i] Student params: {sum(p.numel() for p in student.parameters() if p.requires_grad)/1e6:.3f}M")
 
-    # Teacher model (frozen)
+    # ---- Teacher model (frozen) ----
     teacher = FCNTeacherWithFeat().to(device)
     teacher.eval()
 
-    # Feature alignment module (student high tap: assume 192 ch; teacher layer3: 1024 ch)
-    # If your student "high" channel count is different, adjust c_student accordingly.
+    # ---- Feature align (student 'high' tap: 192 ch, teacher layer3: 1024 ch) ----
     feat_align = FeatureAlign(c_student=192, c_teacher=1024, c_common=256).to(device)
 
     params = list(student.parameters()) + list(feat_align.parameters())
@@ -272,19 +292,19 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
-            # 1. forward student
+            # 1. Student forward
             s_out = student(imgs)
-            s_logits = s_out["out"]              # [B,21,H,W]
-            s_feat   = s_out["taps"]["high"]     # high-level tap, e.g. [B,192,h_s,w_s]
+            s_logits = s_out["out"]          # [B,21,H,W]
+            s_feat   = s_out["taps"]["high"] # [B,192,h_s,w_s]
 
-            # 2. forward teacher (no grad)
+            # 2. Teacher forward (no grad)
             with torch.no_grad():
                 t_logits, t_feat = teacher(imgs)  # t_logits: [B,21,H,W], t_feat: [B,1024,h_t,w_t]
 
-            # 3a. supervised CE loss
+            # 3a. Supervised CE loss
             loss_ce = ce_loss_fn(s_logits, masks)
 
-            # 3b. response-based KD loss
+            # 3b. Response-based KD loss
             loss_kd_resp = response_distillation_loss(
                 student_logits=s_logits,
                 teacher_logits=t_logits,
@@ -293,12 +313,11 @@ def main():
                 ignore_index=IGNORE_INDEX,
             )
 
-            # 3c. feature-based KD loss (cosine on aligned features)
-            # align shapes + channels
+            # 3c. Feature-based KD loss (cosine on aligned features)
             s_feat_aligned, t_feat_aligned = feat_align(s_feat, t_feat)
             loss_kd_feat = feature_distillation_cosine_loss(s_feat_aligned, t_feat_aligned)
 
-            # 3d. total loss
+            # 3d. Total loss
             loss = args.alpha * loss_ce + args.beta * loss_kd_resp + args.gamma * loss_kd_feat
             loss.backward()
             optimizer.step()
@@ -314,17 +333,20 @@ def main():
         scheduler.step()
         train_loss = running_loss / len(train_loader.dataset)
 
-        # validate mIoU of *student* only
+        # Validate student mIoU
         miou = eval_miou(student, val_loader, device)
         print(f"Epoch {epoch:03d}/{args.epochs} | Train total: {train_loss:.4f} | Val mIoU: {miou:.4f} | LR: {optimizer.param_groups[0]['lr']:.3e}")
 
         if miou > best_miou:
             best_miou = miou
-            torch.save({"model": student.state_dict(), "epoch": epoch, "miou": best_miou},
-                       "tinyseg_kd_best.pt")
+            torch.save(
+                {"model": student.state_dict(), "epoch": epoch, "miou": best_miou},
+                "tinyseg_kd_best.pt",
+            )
             print(f"[i] New best KD mIoU {best_miou:.4f}. Saved -> tinyseg_kd_best.pt")
 
     print(f"[✓] KD training done. Best student mIoU: {best_miou:.4f}")
+
 
 if __name__ == "__main__":
     main()
