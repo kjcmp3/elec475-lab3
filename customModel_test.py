@@ -2,15 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 Eval TinySegNet on VOC2012 val: mIoU + optional PNG dumps.
-
-Usage:
-  python customModel_eval.py \
-    --data-root /content/data \
-    --ckpt tinyseg_best.pt \
-    --batch-size 8 \
-    --crop-size 320 \
-    --device cuda \
-    --save-dir preds_val
 """
 
 import argparse
@@ -37,18 +28,16 @@ NUM_CLASSES   = 21
 IGNORE_INDEX  = 255
 
 def voc_palette():
-    palette = [0] * (256 * 3)
+    palette = [0]*(256*3)
     colors = [
-        (0,0,0), (128,0,0), (0,128,0), (128,128,0), (0,0,128),
-        (128,0,128), (0,128,128), (128,128,128), (64,0,0), (192,0,0),
-        (64,128,0), (192,128,0), (64,0,128), (192,0,128), (64,128,128),
-        (192,128,128), (0,64,0), (128,64,0), (0,192,0), (128,192,0),
+        (0,0,0),(128,0,0),(0,128,0),(128,128,0),(0,0,128),
+        (128,0,128),(0,128,128),(128,128,128),(64,0,0),(192,0,0),
+        (64,128,0),(192,128,0),(64,0,128),(192,0,128),(64,128,128),
+        (192,128,128),(0,64,0),(128,64,0),(0,192,0),(128,192,0),
         (0,64,128)
     ]
-    for i, (r,g,b) in enumerate(colors):
-        palette[i*3+0] = r
-        palette[i*3+1] = g
-        palette[i*3+2] = b
+    for i,(r,g,b) in enumerate(colors):
+        palette[i*3+0]=r; palette[i*3+1]=g; palette[i*3+2]=b
     return palette
 
 # --------------------------
@@ -58,13 +47,13 @@ class SE(nn.Module):
     def __init__(self, c: int, r: int = 4):
         super().__init__()
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc1 = nn.Conv2d(c, c // r, 1)
-        self.fc2 = nn.Conv2d(c // r, c, 1)
+        self.fc1 = nn.Conv2d(c, c//r, 1)
+        self.fc2 = nn.Conv2d(c//r, c, 1)
     def forward(self, x):
         s = self.pool(x)
         s = F.silu(self.fc1(s))
         s = torch.sigmoid(self.fc2(s))
-        return x * s
+        return x*s
 
 class DWConvBlock(nn.Module):
     def __init__(self, cin, cout, stride=1, use_se=False):
@@ -81,18 +70,18 @@ class DWConvBlock(nn.Module):
         return x
 
 class ASPPLite(nn.Module):
-    def __init__(self, cin, rates=(1, 6, 12, 18), branch_ch=64):
+    def __init__(self, cin, rates=(1,6,12,18), branch_ch=64):
         super().__init__()
         self.branches = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(cin, branch_ch, 3 if r > 1 else 1, padding=r if r > 1 else 0,
-                          dilation=r if r > 1 else 1, bias=False),
+                nn.Conv2d(cin, branch_ch, 3 if r>1 else 1, padding=r if r>1 else 0,
+                          dilation=r if r>1 else 1, bias=False),
                 nn.BatchNorm2d(branch_ch),
                 nn.SiLU()
             ) for r in rates
         ])
         self.proj = nn.Sequential(
-            nn.Conv2d(branch_ch * len(rates), 256, 1, bias=False),
+            nn.Conv2d(branch_ch*len(rates), 256, 1, bias=False),
             nn.BatchNorm2d(256),
             nn.SiLU(),
             nn.Dropout(0.5)
@@ -111,24 +100,18 @@ class TinySegNet(nn.Module):
             nn.BatchNorm2d(16),
             nn.SiLU()
         )
-        self.s1 = DWConvBlock(16,    chs[0], stride=1, use_se=False)  # 1/2
+        self.s1 = DWConvBlock(16,   chs[0], stride=1, use_se=False)  # 1/2
         self.s2 = DWConvBlock(chs[0], chs[1], stride=2, use_se=False) # 1/4
         self.s3 = DWConvBlock(chs[1], chs[2], stride=2, use_se=True)  # 1/8
         self.s4 = DWConvBlock(chs[2], chs[3], stride=2, use_se=True)  # 1/16
+        self.aspp = ASPPLite(chs[3], rates=(1,6,12,18), branch_ch=64) # -> 256
 
-        self.aspp = ASPPLite(chs[3], rates=(1,6,12,18), branch_ch=64)  # -> 256
         self.mid_proj = nn.Conv2d(chs[1], 64, 1)
         self.low_proj = nn.Conv2d(chs[0], 32, 1)
-        self.dec_mid = nn.Sequential(
-            nn.Conv2d(256, 256, 3, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.SiLU()
-        )
-        self.dec_low = nn.Sequential(
-            nn.Conv2d(64, 64, 3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.SiLU()
-        )
+        self.dec_mid  = nn.Sequential(nn.Conv2d(256, 256, 3, padding=1, bias=False),
+                                      nn.BatchNorm2d(256), nn.SiLU())
+        self.dec_low  = nn.Sequential(nn.Conv2d(64, 64, 3, padding=1, bias=False),
+                                      nn.BatchNorm2d(64), nn.SiLU())
         self.dropout_head = nn.Dropout(0.5)
         self.cls = nn.Conv2d(64, num_classes, 1)
 
@@ -139,13 +122,13 @@ class TinySegNet(nn.Module):
         mid  = self.s2(low)      # 1/4
         h8   = self.s3(mid)      # 1/8
         high = self.s4(h8)       # 1/16
+        ctx = self.aspp(high)    # [N,256,H/16,W/16]
 
-        ctx = self.aspp(high)                          # [N,256,H/16,W/16]
         up_mid   = F.interpolate(ctx, scale_factor=2, mode="bilinear", align_corners=False)
-        fuse_mid = self.dec_mid(up_mid + self.mid_proj(mid))   # [N,256,H/8,W/8]
+        fuse_mid = self.dec_mid(up_mid + self.mid_proj(mid))         # [N,256,H/8,W/8]
         up_low   = F.interpolate(fuse_mid, scale_factor=2, mode="bilinear", align_corners=False)
-        fuse_low = self.dec_low(up_low + self.low_proj(low))   # [N,64,H/4,W/4]
-        logits_4x = self.cls(self.dropout_head(fuse_low))      # [N,21,H/4,W/4]
+        fuse_low = self.dec_low(up_low + self.low_proj(low))         # [N,64,H/4,W/4]
+        logits_4x = self.cls(self.dropout_head(fuse_low))            # [N,21,H/4,W/4]
         logits = F.interpolate(logits_4x, size=(H, W), mode="bilinear", align_corners=False)
         return {"out": logits, "taps": {"low": low, "mid": mid, "high": high}}
 
@@ -158,13 +141,13 @@ def normalize(t: torch.Tensor) -> torch.Tensor:
 def val_transform(img, mask, crop=320):
     h, w = img.height, img.width
     short = min(h, w)
-    scale = 360.0 / short
-    new_size = (int(round(h * scale)), int(round(w * scale)))
-    img = TF.resize(img, new_size, InterpolationMode.BILINEAR)
+    scale = 360.0/short
+    new_size = (int(round(h*scale)), int(round(w*scale)))
+    img  = TF.resize(img,  new_size, InterpolationMode.BILINEAR)
     mask = TF.resize(mask, new_size, InterpolationMode.NEAREST)
-    img = TF.center_crop(img, [crop, crop])
+    img  = TF.center_crop(img,  [crop, crop])
     mask = TF.center_crop(mask, [crop, crop])
-    img_t = normalize(TF.to_tensor(img))
+    img_t  = normalize(TF.to_tensor(img))
     mask_t = TF.pil_to_tensor(mask).squeeze(0).long()
     return img_t, mask_t
 
@@ -202,7 +185,7 @@ def eval_miou(model: nn.Module, loader: DataLoader, device: torch.device) -> Tup
             tc = (masks == c) & valid
             inter[c] += (pc & tc).sum()
             union[c] += (pc | tc).sum()
-    iou = torch.where(union > 0, inter / union, torch.zeros_like(union))
+    iou = torch.where(union > 0, inter/union, torch.zeros_like(union))
     return float(iou.mean().item()), iou.detach().cpu().numpy()
 
 def colorize_mask(mask_np: np.ndarray) -> Image.Image:
@@ -211,24 +194,38 @@ def colorize_mask(mask_np: np.ndarray) -> Image.Image:
     return m
 
 def safe_load_ckpt(path: str, map_location):
-    """
-    Robust across PyTorch 2.6+ (weights_only default) and older versions.
-    """
     p = Path(path)
     if not p.exists() or p.stat().st_size == 0:
         raise FileNotFoundError(f"Checkpoint not found or empty: {p}")
-    if p.suffix.lower() not in {".pt", ".pth"}:
-        print(f"[!] Warning: unusual checkpoint extension: {p.suffix}")
-
     try:
-        # In 2.6+, default weights_only=True; try that first.
-        return torch.load(p, map_location=map_location)
+        return torch.load(p, map_location=map_location)  # PyTorch>=2.6 defaults to weights_only=True
     except Exception as e1:
         print(f"[!] Retry torch.load(weights_only=False) due to: {e1}")
-        try:
-            return torch.load(p, map_location=map_location, weights_only=False)
-        except (pickle.UnpicklingError, RuntimeError) as e2:
-            raise RuntimeError(f"Failed to load checkpoint {p}: {e2}")
+        return torch.load(p, map_location=map_location, weights_only=False)
+
+def load_state_forgiving(model: nn.Module, state: Dict[str, torch.Tensor]) -> None:
+    """Load only keys whose shapes match the current model to avoid size-mismatch errors."""
+    model_sd = model.state_dict()
+    compatible = {}
+    skipped_mismatch = []
+    skipped_missing = []
+    for k, v in state.items():
+        if k in model_sd:
+            if tuple(v.shape) == tuple(model_sd[k].shape):
+                compatible[k] = v
+            else:
+                skipped_mismatch.append((k, tuple(v.shape), tuple(model_sd[k].shape)))
+        else:
+            skipped_missing.append(k)
+
+    msg = f"[i] Loading {len(compatible)} / {len(model_sd)} tensors from checkpoint"
+    print(msg)
+    if skipped_mismatch:
+        print(f"[!] Skipped {len(skipped_mismatch)} keys with shape mismatch (e.g., {skipped_mismatch[0]})")
+    if skipped_missing:
+        print(f"[!] Skipped {len(skipped_missing)} unexpected keys (e.g., {skipped_missing[0]})")
+
+    model.load_state_dict(compatible, strict=False)
 
 # --------------------------
 # Main
@@ -261,11 +258,7 @@ def main():
     model = TinySegNet(num_classes=NUM_CLASSES).to(device)
     ckpt = safe_load_ckpt(args.ckpt, map_location=device)
     state = ckpt.get("model", ckpt)  # supports {'model': state_dict} or raw state_dict
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing or unexpected:
-        print(f"[!] load_state_dict: missing={len(missing)} unexpected={len(unexpected)}")
-        if missing:   print("    missing:", missing[:10], "...")
-        if unexpected:print("    unexpected:", unexpected[:10], "...")
+    load_state_forgiving(model, state)
 
     # evaluate
     miou, per_cls = eval_miou(model, val_loader, device)
@@ -282,8 +275,7 @@ def main():
         with torch.no_grad():
             for imgs, _ in val_loader:
                 imgs = imgs.to(device, non_blocking=True)
-                logits = model(imgs)["out"]
-                pred = logits.argmax(1).detach().cpu().numpy()  # [B,H,W]
+                pred = model(imgs)["out"].argmax(1).detach().cpu().numpy()
                 for i in range(pred.shape[0]):
                     colorize_mask(pred[i]).save(outdir / f"val_{saved:05d}.png")
                     saved += 1
