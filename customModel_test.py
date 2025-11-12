@@ -3,14 +3,14 @@
 """
 Eval TinySegNet on VOC2012 val: mIoU + optional PNG dumps.
 
-Usage (Colab):
+Usage:
   python customModel_eval.py \
     --data-root /content/data \
     --ckpt tinyseg_best.pt \
     --batch-size 8 \
     --crop-size 320 \
     --device cuda \
-    --save-dir preds_val   # optional
+    --save-dir preds_val
 """
 
 import argparse
@@ -60,7 +60,6 @@ class SE(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.fc1 = nn.Conv2d(c, c // r, 1)
         self.fc2 = nn.Conv2d(c // r, c, 1)
-
     def forward(self, x):
         s = self.pool(x)
         s = F.silu(self.fc1(s))
@@ -75,7 +74,6 @@ class DWConvBlock(nn.Module):
         self.pw = nn.Conv2d(cin, cout, 1, bias=False)
         self.pw_bn = nn.BatchNorm2d(cout)
         self.se = SE(cout, r=4) if use_se else nn.Identity()
-
     def forward(self, x):
         x = F.silu(self.dw_bn(self.dw(x)))
         x = F.silu(self.pw_bn(self.pw(x)))
@@ -99,7 +97,6 @@ class ASPPLite(nn.Module):
             nn.SiLU(),
             nn.Dropout(0.5)
         )
-
     def forward(self, x):
         feats = [b(x) for b in self.branches]
         x = torch.cat(feats, dim=1)
@@ -215,19 +212,23 @@ def colorize_mask(mask_np: np.ndarray) -> Image.Image:
 
 def safe_load_ckpt(path: str, map_location):
     """
-    Robust loader across PyTorch versions:
-    - Prefer weights_only=False for PyTorch 2.6+ checkpoints that include non-tensor metadata.
-    - Fall back gracefully if the argument isn't supported.
+    Robust across PyTorch 2.6+ (weights_only default) and older versions.
     """
+    p = Path(path)
+    if not p.exists() or p.stat().st_size == 0:
+        raise FileNotFoundError(f"Checkpoint not found or empty: {p}")
+    if p.suffix.lower() not in {".pt", ".pth"}:
+        print(f"[!] Warning: unusual checkpoint extension: {p.suffix}")
+
     try:
-        # First try explicit False (works on 2.6+)
-        return torch.load(path, map_location=map_location, weights_only=False)
-    except TypeError:
-        # Older PyTorch without weights_only kwarg
-        return torch.load(path, map_location=map_location)
-    except (pickle.UnpicklingError, RuntimeError):
-        # Some environments still need explicit False after a first failure
-        return torch.load(path, map_location=map_location, weights_only=False)
+        # In 2.6+, default weights_only=True; try that first.
+        return torch.load(p, map_location=map_location)
+    except Exception as e1:
+        print(f"[!] Retry torch.load(weights_only=False) due to: {e1}")
+        try:
+            return torch.load(p, map_location=map_location, weights_only=False)
+        except (pickle.UnpicklingError, RuntimeError) as e2:
+            raise RuntimeError(f"Failed to load checkpoint {p}: {e2}")
 
 # --------------------------
 # Main
@@ -280,7 +281,7 @@ def main():
         saved = 0
         with torch.no_grad():
             for imgs, _ in val_loader:
-                imgs = imgs.to(device)
+                imgs = imgs.to(device, non_blocking=True)
                 logits = model(imgs)["out"]
                 pred = logits.argmax(1).detach().cpu().numpy()  # [B,H,W]
                 for i in range(pred.shape[0]):
