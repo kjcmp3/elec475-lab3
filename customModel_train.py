@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TinySegNet on VOC2012 (21 classes): training + evaluation template with mIoU logging.
+TinySegNet on VOC2012 (21 classes): training with mIoU logging.
+
+- Encoder: 4 stages (depthwise-separable convs) with strides {2,2,2,2}
+  channels {24, 40, 96, 192}; SE (r=4) in stages 3–4.
+- Taps: low (1/2), mid (1/4), high (1/16).
+- Context: ASPP-lite (rates {1,6,12,18}, 64 ch each) -> concat 256 -> BN, SiLU, Dropout(0.5).
+- Decoder: robust size-matching (upsample to exact tap sizes).
+  ASPP->64; fuse with mid (64), conv; upsample & reduce to 32, fuse with low (32), conv→64.
+- Classifier: 1×1 -> 21, then upsample to input size.
+- Training: crop=320 (multiple of 16), AdamW(1e-3, wd=1e-4), poly LR, CE(ignore=255).
 """
 
 import argparse
@@ -42,6 +51,7 @@ def normalize(t: torch.Tensor) -> torch.Tensor:
     return TF.normalize(t, IMAGENET_MEAN, IMAGENET_STD)
 
 def train_transform(img, mask, crop=320):
+    # Resize shorter side to ~360 then random crop 320×320 (multiple of 16)
     h, w = img.height, img.width
     short = min(h, w)
     scale = 360.0 / short
@@ -63,6 +73,7 @@ def train_transform(img, mask, crop=320):
     return img_t, mask_t
 
 def val_transform(img, mask, crop=320):
+    # Resize shorter side to ~360 then center crop 320×320
     h, w = img.height, img.width
     short = min(h, w)
     scale = 360.0 / short
@@ -98,7 +109,7 @@ class VOCSegPair(Dataset):
         return img_t, mask_t
 
 # --------------------------
-# Model: TinySegNet (≈≤1M params)
+# Model: TinySegNet
 # --------------------------
 class SE(nn.Module):
     def __init__(self, c: int, r: int = 4):
@@ -167,18 +178,18 @@ class TinySegNet(nn.Module):
 
         self.aspp = ASPPLite(chs[3], rates=(1,6,12,18), branch_ch=64)  # -> 256
 
-        # ---- Decoder projections/aligners ----
-        self.ctx_to_64  = nn.Conv2d(256, 64, 1)   # project ASPP to 64ch to match "mid"
-        self.mid_proj   = nn.Conv2d(chs[1], 64, 1)
-        self.low_proj   = nn.Conv2d(chs[0], 32, 1)
-        self.low_align  = nn.Conv2d(64, 32, 1)    # align upsampled mid path to 32ch before adding low
+        # Decoder projections/aligners (MATCH EVAL)
+        self.ctx_to_64  = nn.Conv2d(256, 64, 1, bias=False)  # ASPP 256 -> 64
+        self.mid_proj   = nn.Conv2d(chs[1], 64, 1, bias=False)
+        self.mid_to_32  = nn.Conv2d(64, 32, 1, bias=False)   # 64 -> 32 for low fusion
+        self.low_proj   = nn.Conv2d(chs[0], 32, 1, bias=False)
 
-        self.dec_mid = nn.Sequential(              # keep 64ch after mid fusion
+        self.dec_mid = nn.Sequential(
             nn.Conv2d(64, 64, 3, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.SiLU()
         )
-        self.dec_low = nn.Sequential(              # after low fusion (32ch) → 64ch
+        self.dec_low = nn.Sequential(
             nn.Conv2d(32, 64, 3, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.SiLU()
@@ -190,25 +201,22 @@ class TinySegNet(nn.Module):
     def forward(self, x) -> Dict[str, torch.Tensor]:
         _, _, H, W = x.shape
         x = self.stem(x)
-        low  = self.s1(x)       # 1/2, C=24
-        mid  = self.s2(low)     # 1/4, C=40
-        h8   = self.s3(mid)     # 1/8, C=96
+        low  = self.s1(x)       # 1/2,  C=24
+        mid  = self.s2(low)     # 1/4,  C=40
+        h8   = self.s3(mid)     # 1/8,  C=96
         high = self.s4(h8)      # 1/16, C=192
 
-        ctx = self.aspp(high)                           # [N,256,H/16,W/16]
-        ctx64 = self.ctx_to_64(ctx)                     # [N,64,H/16,W/16]
-        up_mid = F.interpolate(ctx64, scale_factor=4,   # → 1/4 to match "mid"
-                               mode="bilinear", align_corners=False)
-        fuse_mid = self.dec_mid(up_mid + self.mid_proj(mid))   # [N,64,H/4,W/4]
+        ctx   = self.aspp(high)                                       # [N,256,H/16,W/16]
+        up_m  = F.interpolate(ctx, size=mid.shape[-2:], mode="bilinear", align_corners=False)
+        up_m  = self.ctx_to_64(up_m)                                  # 256->64
+        fuse_m = self.dec_mid(up_m + self.mid_proj(mid))              # [N,64, H/4, W/4]
 
-        up_low = F.interpolate(fuse_mid, scale_factor=2,        # → 1/2 to match "low"
-                               mode="bilinear", align_corners=False)
-        fuse_low_in = self.low_align(up_low) + self.low_proj(low)   # both 32ch @ 1/2
-        fuse_low = self.dec_low(fuse_low_in)                   # [N,64,H/2,W/2]
+        up_l  = F.interpolate(fuse_m, size=low.shape[-2:], mode="bilinear", align_corners=False)
+        up_l  = self.mid_to_32(up_l)                                  # 64->32
+        fuse_l = self.dec_low(up_l + self.low_proj(low))              # [N,64, H/2, W/2]
 
-        logits_half = self.cls(self.dropout_head(fuse_low))    # [N,21,H/2,W/2]
+        logits_half = self.cls(self.dropout_head(fuse_l))             # [N,21,H/2,W/2]
         logits = F.interpolate(logits_half, size=(H, W), mode="bilinear", align_corners=False)
-
         return {"out": logits, "taps": {"low": low, "mid": mid, "high": high}}
 
 def count_params(m: nn.Module) -> int:
@@ -267,7 +275,7 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--crop-size", type=int, default=320)
+    ap.add_argument("--crop-size", type=int, default=320)  # multiple of 16
     ap.add_argument("--num-workers", "--workers", dest="workers", type=int, default=2)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -280,10 +288,11 @@ def main():
     train_set = VOCSegPair(voc_root, image_set="train", transform_kind="train", crop_size=args.crop_size)
     val_set   = VOCSegPair(voc_root, image_set="val",   transform_kind="val",   crop_size=args.crop_size)
 
+    pin = (args.device == "cuda")
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.workers, pin_memory=True, drop_last=True)
+                              num_workers=args.workers, pin_memory=pin, drop_last=True)
     val_loader   = DataLoader(val_set, batch_size=max(1, args.batch_size//2), shuffle=False,
-                              num_workers=args.workers, pin_memory=True)
+                              num_workers=args.workers, pin_memory=pin)
 
     model = TinySegNet(num_classes=NUM_CLASSES)
     print(f"[i] TinySegNet params: {count_params(model)/1e6:.3f}M")
