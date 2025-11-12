@@ -224,7 +224,21 @@ def main():
 
     device = torch.device(args.device)
     val_set = VOCSegPair(Path(args.data_root), crop_size=args.crop_size)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=2)
+
+    def collate_keep_pil(batch):
+        """Custom collate_fn: stack tensors, keep PILs as list."""
+        imgs = torch.stack([b["img"] for b in batch])
+        masks = torch.stack([b["mask"] for b in batch])
+        pils = [b["pil"] for b in batch]  # keep unstacked
+        return {"img": imgs, "mask": masks, "pil": pils}
+
+    val_loader = DataLoader(
+        val_set,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=2,
+        collate_fn=collate_keep_pil,
+    )
 
     model = TinySegNet().to(device)
     ckpt = torch.load(args.ckpt, map_location=device)
