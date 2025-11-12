@@ -116,18 +116,18 @@ class TinySegNet(nn.Module):
 
         self.aspp = ASPPLite(chs[3], rates=(1,6,12,18), branch_ch=64)  # -> 256
 
-        # ---- Decoder (MUST MATCH TRAIN) ----
-        self.ctx_to_64  = nn.Conv2d(256, 64, 1)   # project ASPP to 64ch
-        self.mid_proj   = nn.Conv2d(chs[1], 64, 1)
-        self.low_proj   = nn.Conv2d(chs[0], 32, 1)
-        self.low_align  = nn.Conv2d(64, 32, 1)    # align upsampled mid path to 32ch
+        # EXACTLY match training:
+        self.ctx_to_64 = nn.Conv2d(256, 64, 1, bias=False)  # project ASPP to 64
+        self.mid_proj  = nn.Conv2d(chs[1], 64, 1, bias=False)
+        self.low_proj  = nn.Conv2d(chs[0], 32, 1, bias=False)
+        self.low_align = nn.Conv2d(64, 32, 1, bias=False)   # align 64->32 before low fusion
 
-        self.dec_mid = nn.Sequential(             # keep 64ch after mid fusion
+        self.dec_mid = nn.Sequential(
             nn.Conv2d(64, 64, 3, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.SiLU()
         )
-        self.dec_low = nn.Sequential(             # after low fusion (32ch) → 64ch
+        self.dec_low = nn.Sequential(
             nn.Conv2d(32, 64, 3, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.SiLU()
@@ -144,21 +144,18 @@ class TinySegNet(nn.Module):
         h8   = self.s3(mid)     # 1/8, C=96
         high = self.s4(h8)      # 1/16, C=192
 
-        ctx = self.aspp(high)                           # [N,256,H/16,W/16]
-        ctx64 = self.ctx_to_64(ctx)                     # [N,64,H/16,W/16]
-        up_mid = F.interpolate(ctx64, scale_factor=4,   # → 1/4 to match "mid"
-                               mode="bilinear", align_corners=False)
-        fuse_mid = self.dec_mid(up_mid + self.mid_proj(mid))   # [N,64,H/4,W/4]
+        ctx = self.aspp(high)                             # [N,256,H/16,W/16]
+        up_mid = F.interpolate(self.ctx_to_64(ctx),       # 256->64
+                               size=mid.shape[-2:], mode="bilinear", align_corners=False)
+        fuse_mid = self.dec_mid(up_mid + self.mid_proj(mid))  # [N,64,1/4,1/4]
 
-        up_low = F.interpolate(fuse_mid, scale_factor=2,        # → 1/2 to match "low"
-                               mode="bilinear", align_corners=False)
-        fuse_low_in = self.low_align(up_low) + self.low_proj(low)   # both 32ch
-        fuse_low = self.dec_low(fuse_low_in)                   # [N,64,H/2,W/2]
+        up_low = F.interpolate(fuse_mid, size=low.shape[-2:], mode="bilinear", align_corners=False)
+        fuse_low = self.dec_low(self.low_align(up_low) + self.low_proj(low))  # (32+32)->64 @ 1/2
 
-        logits_half = self.cls(self.dropout_head(fuse_low))    # [N,21,H/2,W/2]
+        logits_half = self.cls(self.dropout_head(fuse_low))  # [N,21,1/2,1/2]
         logits = F.interpolate(logits_half, size=(H, W), mode="bilinear", align_corners=False)
-
         return {"out": logits, "taps": {"low": low, "mid": mid, "high": high}}
+
 
 # --------------------------
 # Transforms (eval) — sizes multiple of 16
