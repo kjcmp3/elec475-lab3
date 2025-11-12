@@ -35,8 +35,6 @@ IMAGENET_STD  = [0.229, 0.224, 0.225]
 NUM_CLASSES   = 21
 IGNORE_INDEX  = 255
 
-# Standard VOC color palette (len <= 256*3)
-# (same as many examples; you can customize if you want)
 def voc_palette():
     palette = [0] * (256 * 3)
     colors = [
@@ -115,7 +113,7 @@ class TinySegNet(nn.Module):
             nn.BatchNorm2d(16),
             nn.SiLU()
         )
-        self.s1 = DWConvBlock(16,    chs[0], stride=1, use_se=False) # 1/2
+        self.s1 = DWConvBlock(16,    chs[0], stride=1, use_se=False)  # 1/2
         self.s2 = DWConvBlock(chs[0], chs[1], stride=2, use_se=False) # 1/4
         self.s3 = DWConvBlock(chs[1], chs[2], stride=2, use_se=True)  # 1/8
         self.s4 = DWConvBlock(chs[2], chs[3], stride=2, use_se=True)  # 1/16
@@ -123,10 +121,16 @@ class TinySegNet(nn.Module):
         self.aspp = ASPPLite(chs[3], rates=(1,6,12,18), branch_ch=64)  # -> 256
         self.mid_proj = nn.Conv2d(chs[1], 64, 1)
         self.low_proj = nn.Conv2d(chs[0], 32, 1)
-        self.dec_mid = nn.Sequential(nn.Conv2d(256, 256, 3, padding=1, bias=False),
-                                     nn.BatchNorm2d(256), nn.SiLU())
-        self.dec_low = nn.Sequential(nn.Conv2d(64, 64, 3, padding=1, bias=False),
-                                     nn.BatchNorm2d(64), nn.SiLU())
+        self.dec_mid = nn.Sequential(
+            nn.Conv2d(256, 256, 3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.SiLU()
+        )
+        self.dec_low = nn.Sequential(
+            nn.Conv2d(64, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.SiLU()
+        )
         self.dropout_head = nn.Dropout(0.5)
         self.cls = nn.Conv2d(64, num_classes, 1)
 
@@ -138,12 +142,12 @@ class TinySegNet(nn.Module):
         h8   = self.s3(mid)      # 1/8
         high = self.s4(h8)       # 1/16
 
-        ctx = self.aspp(high)    # [N,256,H/16,W/16]
+        ctx = self.aspp(high)                          # [N,256,H/16,W/16]
         up_mid   = F.interpolate(ctx, scale_factor=2, mode="bilinear", align_corners=False)
-        fuse_mid = self.dec_mid(up_mid + self.mid_proj(mid))         # [N,256,H/8,W/8]
+        fuse_mid = self.dec_mid(up_mid + self.mid_proj(mid))   # [N,256,H/8,W/8]
         up_low   = F.interpolate(fuse_mid, scale_factor=2, mode="bilinear", align_corners=False)
-        fuse_low = self.dec_low(up_low + self.low_proj(low))         # [N,64,H/4,W/4]
-        logits_4x = self.cls(self.dropout_head(fuse_low))            # [N,21,H/4,W/4]
+        fuse_low = self.dec_low(up_low + self.low_proj(low))   # [N,64,H/4,W/4]
+        logits_4x = self.cls(self.dropout_head(fuse_low))      # [N,21,H/4,W/4]
         logits = F.interpolate(logits_4x, size=(H, W), mode="bilinear", align_corners=False)
         return {"out": logits, "taps": {"low": low, "mid": mid, "high": high}}
 
@@ -154,7 +158,6 @@ def normalize(t: torch.Tensor) -> torch.Tensor:
     return TF.normalize(t, IMAGENET_MEAN, IMAGENET_STD)
 
 def val_transform(img, mask, crop=320):
-    # same as training's val_transform: resize shorter side to 360, center-crop 320
     h, w = img.height, img.width
     short = min(h, w)
     scale = 360.0 / short
@@ -205,10 +208,25 @@ def eval_miou(model: nn.Module, loader: DataLoader, device: torch.device) -> Tup
     return float(iou.mean().item()), iou.detach().cpu().numpy()
 
 def colorize_mask(mask_np: np.ndarray) -> Image.Image:
-    # mask_np: [H,W] int array
     m = Image.fromarray(mask_np.astype(np.uint8), mode="P")
     m.putpalette(voc_palette())
     return m
+
+def safe_load_ckpt(path: str, map_location):
+    """
+    Robust loader across PyTorch versions:
+    - Prefer weights_only=False for PyTorch 2.6+ checkpoints that include non-tensor metadata.
+    - Fall back gracefully if the argument isn't supported.
+    """
+    try:
+        # First try explicit False (works on 2.6+)
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        # Older PyTorch without weights_only kwarg
+        return torch.load(path, map_location=map_location)
+    except (pickle.UnpicklingError, RuntimeError):
+        # Some environments still need explicit False after a first failure
+        return torch.load(path, map_location=map_location, weights_only=False)
 
 # --------------------------
 # Main
@@ -233,13 +251,14 @@ def main():
 
     # dataset / loader
     val_set = VOCSegPair(voc_root, crop_size=args.crop_size)
+    pin = device.type == "cuda"
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.num_workers, pin_memory=True)
+                            num_workers=args.num_workers, pin_memory=pin)
 
     # model + checkpoint
     model = TinySegNet(num_classes=NUM_CLASSES).to(device)
-    ckpt = torch.load(args.ckpt, map_location=device)
-    state = ckpt.get("model", ckpt)  # support both wrapped and raw state_dict
+    ckpt = safe_load_ckpt(args.ckpt, map_location=device)
+    state = ckpt.get("model", ckpt)  # supports {'model': state_dict} or raw state_dict
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:
         print(f"[!] load_state_dict: missing={len(missing)} unexpected={len(unexpected)}")
@@ -259,13 +278,12 @@ def main():
         model.eval()
         saved = 0
         with torch.no_grad():
-            for imgs, masks in val_loader:
+            for imgs, _ in val_loader:
                 imgs = imgs.to(device)
                 logits = model(imgs)["out"]
                 pred = logits.argmax(1).detach().cpu().numpy()  # [B,H,W]
                 for i in range(pred.shape[0]):
-                    pm = colorize_mask(pred[i])
-                    pm.save(outdir / f"val_{saved:05d}.png")
+                    colorize_mask(pred[i]).save(outdir / f"val_{saved:05d}.png")
                     saved += 1
                     if saved >= args.save_max:
                         break
