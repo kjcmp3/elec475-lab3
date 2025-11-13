@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Knowledge Distillation training script:
+Knowledge Distillation training script with CSV logging and training curves.
 
 Teacher: pretrained FCN-ResNet50 (21 classes, VOC label mapping)
 Student: custom TinyVOCSeg from customModel.py
@@ -26,6 +26,8 @@ Run example (Colab):
 """
 
 import argparse
+import csv
+import time
 from pathlib import Path
 from typing import Tuple
 
@@ -41,6 +43,7 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 from torchvision.models.segmentation import fcn_resnet50, FCN_ResNet50_Weights
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 from distillation_losses import (
     response_distillation_loss,
@@ -237,6 +240,11 @@ def main():
     ap.add_argument("--beta",  type=float, default=1.0, help="weight for response-based KD")
     ap.add_argument("--gamma", type=float, default=0.1, help="weight for feature-based KD")
     ap.add_argument("--temperature", type=float, default=4.0, help="temperature for KD")
+
+    # logging / curves
+    ap.add_argument("--log-csv", type=str, default="kd_train_log.csv")
+    ap.add_argument("--curves-png", type=str, default="kd_training_curves.png")
+
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -277,13 +285,27 @@ def main():
 
     ce_loss_fn = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
 
+    # ----- metric storage for curves -----
+    epochs = []
+    train_total_losses = []
+    train_ce_losses = []
+    val_mious = []
+    lrs = []
+    epoch_secs = []
+
     best_miou = 0.0
+    csv_path = Path(args.log_csv)
+    header_written = False
+
     for epoch in range(1, args.epochs + 1):
         student.train()
         feat_align.train()
         teacher.eval()
 
-        running_loss = 0.0
+        running_total = 0.0
+        running_ce = 0.0
+        t0 = time.time()
+
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
 
         for imgs, masks in pbar:
@@ -317,12 +339,14 @@ def main():
             s_feat_aligned, t_feat_aligned = feat_align(s_feat, t_feat)
             loss_kd_feat = feature_distillation_cosine_loss(s_feat_aligned, t_feat_aligned)
 
-            # 3d. Total loss
+            # 3d. Total KD loss
             loss = args.alpha * loss_ce + args.beta * loss_kd_resp + args.gamma * loss_kd_feat
             loss.backward()
             optimizer.step()
 
-            running_loss += float(loss.item()) * imgs.size(0)
+            running_total += float(loss.item()) * imgs.size(0)
+            running_ce += float(loss_ce.item()) * imgs.size(0)
+
             pbar.set_postfix({
                 "CE": f"{loss_ce.item():.3f}",
                 "KD_resp": f"{loss_kd_resp.item():.3f}",
@@ -331,12 +355,44 @@ def main():
             })
 
         scheduler.step()
-        train_loss = running_loss / len(train_loader.dataset)
+        train_total = running_total / len(train_loader.dataset)
+        train_ce = running_ce / len(train_loader.dataset)
 
         # Validate student mIoU
         miou = eval_miou(student, val_loader, device)
-        print(f"Epoch {epoch:03d}/{args.epochs} | Train total: {train_loss:.4f} | Val mIoU: {miou:.4f} | LR: {optimizer.param_groups[0]['lr']:.3e}")
+        cur_lr = optimizer.param_groups[0]['lr']
+        dt = time.time() - t0
 
+        print(
+            f"Epoch {epoch:03d}/{args.epochs} | "
+            f"Train total: {train_total:.4f} | Train CE: {train_ce:.4f} | "
+            f"Val mIoU: {miou:.4f} | LR: {cur_lr:.3e} | {dt:.1f}s"
+        )
+
+        # store metrics
+        epochs.append(epoch)
+        train_total_losses.append(train_total)
+        train_ce_losses.append(train_ce)
+        val_mious.append(miou)
+        lrs.append(cur_lr)
+        epoch_secs.append(dt)
+
+        # CSV log
+        with csv_path.open("a", newline="") as f:
+            w = csv.writer(f)
+            if (not header_written) and (not csv_path.exists() or csv_path.stat().st_size == 0):
+                w.writerow(["epoch", "train_total", "train_ce", "val_miou", "lr", "epoch_seconds"])
+                header_written = True
+            w.writerow([
+                epoch,
+                f"{train_total:.6f}",
+                f"{train_ce:.6f}",
+                f"{miou:.6f}",
+                f"{cur_lr:.6e}",
+                f"{dt:.3f}",
+            ])
+
+        # save best
         if miou > best_miou:
             best_miou = miou
             torch.save(
@@ -345,7 +401,41 @@ def main():
             )
             print(f"[i] New best KD mIoU {best_miou:.4f}. Saved -> tinyseg_kd_best.pt")
 
+    # ---- Plot curves at the end (same style as customModel_train) ----
+    try:
+        fig = plt.figure(figsize=(9, 6))
+
+        # Top: training loss
+        ax1 = fig.add_subplot(2, 1, 1)
+        ax1.plot(epochs, train_total_losses, label="Train total loss (CE + KD)")
+        ax1.set_xlabel("Epoch")
+        ax1.set_ylabel("Loss")
+        ax1.grid(True)
+        ax1.legend()
+
+        # Bottom: mIoU + LR
+        ax2 = fig.add_subplot(2, 1, 2)
+        ax2.plot(epochs, val_mious, label="Val mIoU")
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("mIoU")
+        ax2.grid(True)
+
+        ax2_t = ax2.twinx()
+        ax2_t.plot(epochs, lrs, linestyle="--", label="LR")
+        ax2_t.set_ylabel("Learning Rate")
+
+        lines, labels = ax2.get_legend_handles_labels()
+        lines2, labels2 = ax2_t.get_legend_handles_labels()
+        ax2.legend(lines + lines2, labels + labels2, loc="best")
+
+        plt.tight_layout()
+        plt.savefig(args.curves_png, dpi=150)
+        print(f"[i] Saved KD curves -> {args.curves_png}")
+    except Exception as e:
+        print(f"[!] Plotting KD curves failed: {e}")
+
     print(f"[✓] KD training done. Best student mIoU: {best_miou:.4f}")
+    print(f"[i] KD log CSV: {csv_path.resolve()}")
 
 
 if __name__ == "__main__":
